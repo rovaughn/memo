@@ -227,10 +227,12 @@ loop2:
 	return CheckMulti(checks), nil
 }
 
-// Checks if the command described by .cache/name needs to be rerun because
+const cachedir string = ".memo"
+
+// Checks if the command described by cachedir/name needs to be rerun because
 // something in its environment has changed.
 func NeedsRerun(name string) (bool, error) {
-	logfile, err := os.Open(".cache/" + name)
+	logfile, err := os.Open(cachedir + "/" + name)
 	if os.IsNotExist(err) {
 		return true, nil
 	} else if err != nil {
@@ -261,8 +263,8 @@ func main() {
 	gob.Register(new(CheckNotFound))
 	gob.Register(new(CheckDir))
 
-	if err := os.MkdirAll(".cache", 0755); err != nil {
-		log.Fatal("Making .cache", err)
+	if err := os.MkdirAll(cachedir, 0755); err != nil {
+		log.Fatalf("Making %q: %s", cachedir, err)
 	}
 
 	command := flag.Args()
@@ -281,7 +283,7 @@ func main() {
 			log.Fatal("Running command", err)
 		}
 
-		file, err := os.Create(".cache/" + name)
+		file, err := os.Create(cachedir + "/" + name)
 		if err != nil {
 			log.Fatal("Creating tracefile", err)
 		}
