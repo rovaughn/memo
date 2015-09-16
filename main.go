@@ -6,9 +6,11 @@ import (
 	"encoding/gob"
 	"flag"
 	"fmt"
+	"github.com/howeyc/fsnotify"
 	"log"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strings"
@@ -27,7 +29,11 @@ func Changef(format string, args ...interface{}) Change {
 
 // A check to see if something has changed.
 type Check interface {
+	// Returns nil if nothing changed; otherwise a Change
+	// describing what changed.
 	Changed() Change
+
+	Watch(watcher *fsnotify.Watcher) error
 }
 
 // A check composed of multiple other checks.
@@ -37,6 +43,16 @@ func (c CheckMulti) Changed() Change {
 	for _, check := range c {
 		if change := check.Changed(); change != nil {
 			return change
+		}
+	}
+
+	return nil
+}
+
+func (c CheckMulti) Watch(watcher *fsnotify.Watcher) error {
+	for _, check := range c {
+		if err := check.Watch(watcher); err != nil {
+			return err
 		}
 	}
 
@@ -68,6 +84,10 @@ func (c *CheckStat) Changed() Change {
 	return nil
 }
 
+func (c *CheckStat) Watch(watcher *fsnotify.Watcher) error {
+	return wrap(c.Path, watcher.Watch(c.Path))
+}
+
 // Checks if the file still doesn't exist.
 type CheckNotFound struct {
 	Path string
@@ -80,6 +100,10 @@ func (c *CheckNotFound) Changed() Change {
 	} else {
 		return Changef("%q now exists", c.Path)
 	}
+}
+
+func (c *CheckNotFound) Watch(watcher *fsnotify.Watcher) error {
+	return wrap(c.Path, watcher.Watch(path.Dir(c.Path)))
 }
 
 // Checks if the file is a dir.
@@ -98,8 +122,14 @@ func (c *CheckDir) Changed() Change {
 	}
 }
 
+func (c *CheckDir) Watch(watcher *fsnotify.Watcher) error {
+	return wrap(c.Path, watcher.Watch(c.Path))
+}
+
 var reCall *regexp.Regexp = regexp.MustCompile(`^\d+\s+(\w+)\("(.*?)"(.*)$`)
 var reIgnore *regexp.Regexp = regexp.MustCompile(`^\d+\s+(\+{3}|-{3})`)
+
+var ignore []string = []string{"/tmp", "/proc"}
 
 // Parse a line from strace into a Check.
 func ParseLine(line string) (Check, error) {
@@ -115,8 +145,10 @@ func ParseLine(line string) (Check, error) {
 		//call := m[1]
 		path := m[2]
 
-		if strings.HasPrefix(path, "/tmp") || strings.HasPrefix(path, "/proc") {
-			return nil, nil
+		for _, prefix := range ignore {
+			if strings.HasPrefix(path, prefix) {
+				return nil, nil
+			}
 		}
 
 		//args := m[3]
@@ -255,44 +287,138 @@ func NeedsRerun(name string) (bool, error) {
 	return change != nil, nil
 }
 
-func main() {
-	flag.Parse()
+func wrap(message string, err error) error {
+	if err == nil {
+		return err
+	} else {
+		return fmt.Errorf("%s: %s", message, err)
+	}
+}
 
+func Main(watch bool, command []string) error {
 	gob.Register(CheckMulti{})
 	gob.Register(new(CheckStat))
 	gob.Register(new(CheckNotFound))
 	gob.Register(new(CheckDir))
 
 	if err := os.MkdirAll(cachedir, 0755); err != nil {
-		log.Fatalf("Making %q: %s", cachedir, err)
+		return wrap("Creating cachedir", err)
 	}
-
-	command := flag.Args()
 
 	name := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%v", command)))
 
-	needsRerun, err := NeedsRerun(name)
-	if err != nil {
-		log.Fatal("Checking if needs rerun", err)
-	}
-
-	if needsRerun {
-		fmt.Println("Running", command)
-		check, err := Run(command[0], command[1:]...)
+	if !watch {
+		needsRerun, err := NeedsRerun(name)
 		if err != nil {
-			log.Fatal("Running command", err)
+			return wrap("Needs rerun?", err)
 		}
 
-		file, err := os.Create(cachedir + "/" + name)
-		if err != nil {
-			log.Fatal("Creating tracefile", err)
-		}
-		defer file.Close()
+		if needsRerun {
+			fmt.Println("Running", command)
+			check, err := Run(command[0], command[1:]...)
+			if err != nil {
+				return fmt.Errorf("Running %v: %s", command, err)
+			}
 
-		if err := gob.NewEncoder(file).Encode(check); err != nil {
-			log.Fatal("Decoding tracefile", err)
+			file, err := os.Create(cachedir + "/" + name)
+			if err != nil {
+				return wrap("Creating cache file", err)
+			}
+			defer file.Close()
+
+			if err := gob.NewEncoder(file).Encode(check); err != nil {
+				return wrap("Encoding check", err)
+			}
+		} else {
+			fmt.Println("Skipping", command)
 		}
 	} else {
-		fmt.Println("Skipping", command)
+		var watcher *fsnotify.Watcher
+		var check Check = &CheckMulti{}
+		var change Change
+
+		logfile, err := os.OpenFile(cachedir+"/"+name, os.O_RDWR, 0644)
+		if os.IsNotExist(err) {
+			logfile, err = os.OpenFile(cachedir+"/"+name, os.O_RDWR|os.O_CREATE, 0644)
+			if err != nil {
+				return wrap("Creating logfile", err)
+			}
+
+			goto rerun
+		} else if err != nil {
+			return wrap("Opening logfile", err)
+		}
+		defer logfile.Close()
+
+		if err := gob.NewDecoder(logfile).Decode(check); err != nil {
+			return wrap("Decoding check", err)
+		}
+
+		change = check.Changed()
+		if change != nil {
+			fmt.Println(*change)
+			goto rerun
+		}
+
+		goto wait
+
+	rerun:
+		fmt.Println("Running", command)
+		check, err = Run(command[0], command[1:]...)
+		if err != nil {
+			return fmt.Errorf("Running %v: %s", command, err)
+		}
+
+		if off, err := logfile.Seek(0, 0); err != nil {
+			log.Println("seek", off, err)
+			return wrap("seek", err)
+		}
+
+		if err := logfile.Truncate(0); err != nil {
+			return wrap("truncate", err)
+		}
+
+		if err := gob.NewEncoder(logfile).Encode(check); err != nil {
+			return wrap("Encode check", err)
+		}
+
+	wait:
+		watcher, err = fsnotify.NewWatcher()
+		if err != nil {
+			return wrap("New watcher", err)
+		}
+		defer watcher.Close()
+
+		if err := check.Watch(watcher); err != nil {
+			return wrap("Watch", err)
+		}
+
+		for {
+			select {
+			case <-watcher.Event:
+				if change := check.Changed(); change != nil {
+					log.Println("Change:", *change)
+					if err := watcher.Close(); err != nil {
+						return fmt.Errorf("watcher close: %s", err)
+					}
+					goto rerun
+				}
+			case err := <-watcher.Error:
+				return fmt.Errorf("watcher: %s", err)
+			}
+		}
+	}
+
+	return nil
+}
+
+func main() {
+	watch := flag.Bool("watch", false, "Watch for changes to any of command's dependencies, and rerun.")
+	flag.Parse()
+
+	command := flag.Args()
+
+	if err := Main(*watch, command); err != nil {
+		log.Fatal(err)
 	}
 }
