@@ -203,6 +203,7 @@ match log with
     then r_memo log' action
     else action
   )
+| TExit status :: log' => Exit status
 | _ => action
 end.
 
@@ -217,7 +218,7 @@ Proof. induction log.
 - intros. reflexivity.
 Qed.
 
-Lemma r_memo_correct: forall a f, r_memo (trace a f) a ~ a.
+Theorem r_memo_correct: forall a f, r_memo (trace a f) a ~ a.
 Proof. induction a.
 - simpl. unfold action_eq. intros f f'.
   simpl. destruct (rreq (read p f) (read p f')) eqn:Heq.
@@ -239,4 +240,67 @@ match w, r with
 | _, _ => false
 end.
 
+Lemma wreq_correct: forall d w p f,
+wreq d w (read p f) = true -> write p d f = (w, f).
+Proof. admit. Admitted.
+
+Fixpoint rw_memo log action :=
+match log with
+| TRead path result :: log' =>
+  Read path (fun result' =>
+    if rreq result result'
+    then rw_memo log' action
+    else action
+  )
+| TWrite path data result :: log' =>
+  Read path (fun result' =>
+    if wreq data result result'
+    then rw_memo log' action
+    else action
+  )
+| TExit status :: log' => Exit status
+| _ => action
+end.
+
+Lemma rw_memo_fold_read: forall log a p f f',
+run (rw_memo (trace log f) (Read p a)) f' =
+run (rw_memo (trace log f) (a (read p f'))) f'.
+Proof. induction log.
+- intros. simpl. destruct (rreq (read p f) (read p f')).
+  + apply H.
+  + reflexivity.
+- intros. simpl. destruct (write p d f). simpl.
+  destruct (wreq d w (read p f')).
+  + apply H.
+  + reflexivity.
+- intros. reflexivity.
+Qed.
+
+Lemma rw_memo_fold_write: forall log w a p d f f' f'',
+(w, f'') = write p d f' ->
+run (rw_memo (trace log f) (Write p d a)) f' =
+run (rw_memo (trace log f) (a w)) f''.
+Admitted.
+
+Theorem rw_memo_correct: forall a f, rw_memo (trace a f) a ~ a.
+Proof. induction a.
+- simpl. unfold action_eq. intros f f'.
+  simpl. destruct (rreq (read p f) (read p f')) eqn:Heq.
+  + apply rreq_eq in Heq. rewrite rw_memo_fold_read.
+    rewrite <- Heq.
+    clear Heq. generalize dependent f'. rewrite <- action_eq_run.
+    pose (H (read p f)). apply a0.
+  + reflexivity.
+- simpl. unfold action_eq. intros f f'. simpl.
+  destruct (write p d f) eqn:H1, (write p d f') eqn:H2. simpl.
+  destruct (wreq d w (read p f')) eqn:Heq.
+  + apply wreq_correct in Heq. rewrite Heq in H2. inversion H2.
+    rewrite <- H4. rewrite rw_memo_fold_write with (w := w) (f'' := f1).
+    rewrite H4. clear H1. clear H2. clear H4. generalize dependent f1.
+    rewrite <- action_eq_run. rewrite H3. apply H.
+    rewrite <- H4. symmetry. apply Heq.
+  + simpl. destruct (write p d f'). inversion H2.
+    reflexivity.
+- intros. simpl. apply action_eq_refl.
+Qed.
 
