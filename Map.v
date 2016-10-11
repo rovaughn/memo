@@ -28,3 +28,13 @@ match m with
 | nil => false
 | (k, v) :: m' => orb (f k v) (map_any f m')
 end.
+
+Lemma map_reeinsert: forall (K V : Type) eq m (k : K) (v : V),
+(forall x y, eq x y = true -> x = y) -> lookup eq k m = Some v -> insert eq k v m = m.
+Proof. induction m.
+- intros. inversion H0.
+- intros. simpl. simpl in H0. destruct a. destruct (eq k k0) eqn:Heq.
+  + inversion H0. replace k0 with k. congruence. apply H. apply Heq.
+  + replace (insert eq k v m) with m. congruence. symmetry. apply IHm.
+    apply H. apply H0.
+Qed.

@@ -1,11 +1,14 @@
 Require Export Map.
 Require Export List.
 
+(* A syscall is something a program calls to modify its environment or make
+   a query.  A syscall also returns a result (or potentially kills the program.
+*)
 
 Definition Component := nat.
 Definition Path := list Component.
 Definition Data := nat.
-Definition ExitStatus := nat.
+Definition ExitStatus := bool.
 
 Inductive Files :=
 | Dir : Map Component Files -> Files
@@ -14,6 +17,7 @@ Inductive Files :=
 
 Inductive ReadResult :=
 | ReadIsDir : ReadResult
+| ReadNoPath : ReadResult
 | ReadNoEnt : ReadResult
 | ReadNotDir : ReadResult
 | ReadSuccess : Data -> ReadResult
@@ -21,7 +25,7 @@ Inductive ReadResult :=
 
 Inductive WriteResult :=
 | WriteIsDir : WriteResult
-| WriteNoEnt : WriteResult
+| WriteNoPath : WriteResult
 | WriteNotDir : WriteResult
 | WriteSuccess : WriteResult
 .
@@ -36,7 +40,11 @@ match path, files with
 | name :: path', Dir entries =>
   match lookup eqcomp name entries with
   | Some files' => read path' files'
-  | None => ReadNoEnt
+  | None =>
+    match path' with
+    | _ :: _ => ReadNoPath
+    | _      => ReadNoEnt
+    end
   end
 end.
 
@@ -50,7 +58,7 @@ match path, files with
   | None =>
     match path' with
     | nil => (WriteSuccess, Dir (insert eqcomp name (File data) entries))
-    | _   => (WriteNoEnt, files)
+    | _   => (WriteNoPath, files)
     end
   | Some subfiles =>
     let (wr, subfiles') := write path' data subfiles
@@ -67,10 +75,10 @@ Example ex4 : read (4::nil) exfs = ReadNoEnt. reflexivity. Qed.
 Example ex5 : write (1::nil) 5 exfs = (WriteSuccess, Dir ((1, File 5) :: (2, File 2) :: (3, File 3) :: nil)). reflexivity. Qed.
 Example ex6 : write (4::nil) 4 exfs = (WriteSuccess, Dir ((1, File 1) :: (2, File 2) :: (3, File 3) :: (4, File 4) :: nil)). simpl. reflexivity. Qed.
 
-Inductive Action :=
-| Read : Path -> (ReadResult -> Action) -> Action
-| Write : Path -> Data -> (WriteResult -> Action) -> Action
-| Exit : ExitStatus -> Action
+Inductive Program :=
+| Read : Path -> (ReadResult -> Program) -> Program
+| Write : Path -> Data -> (WriteResult -> Program) -> Program
+| Exit : ExitStatus -> Program
 .
 
 Inductive Trace :=
@@ -79,107 +87,121 @@ Inductive Trace :=
 | TExit : ExitStatus -> Trace
 .
 
+(* equivalent to ; in bash.  followed_by a b executes a then b, regardless of
+   a's exit status. *)
+Fixpoint followed_by a b :=
+match a with
+| Read path next => Read path (fun rr => followed_by (next rr) b)
+| Write path data next => Write path data (fun rr => followed_by (next rr) b)
+| Exit _ => b
+end.
+
+(* equivalent to && in bash.  and_then a b executes a and if it's successful
+   also executes b. *)
 Fixpoint and_then a b :=
 match a with
 | Read path next => Read path (fun rr => and_then (next rr) b)
 | Write path data next => Write path data (fun rr => and_then (next rr) b)
-| Exit n =>
-  match n with
-  | 0 => b
-  | n => Exit n
-  end
+| Exit true => b
+| Exit false => Exit false
 end.
 
+(* equivalent to || in bash.  or_else a b executes a and only if it fails
+   executes b. *)
 Fixpoint or_else a b :=
 match a with
 | Read path next => Read path (fun rr => or_else (next rr) b)
 | Write path data next => Write path data (fun rr => or_else (next rr) b)
-| Exit n =>
-  match n with
-  | 0 => Exit 0
-  | n => b
-  end
+| Exit true => Exit true
+| Exit false => b
 end.
 
-Fixpoint trace action files: list Trace :=
-match action with
+(* produce the trace log from running a program. *)
+Fixpoint trace program files: list Trace :=
+match program with
 | Read path next =>
   let rr := read path files
   in TRead path rr :: trace (next rr) files
 | Write path data next =>
   let (wr, files') := write path data files
   in TWrite path data wr :: trace (next wr) files'
-| Exit n => TExit n :: nil
+| Exit e => TExit e :: nil
 end.
 
-Fixpoint run action files: Files :=
-match action with
+Fixpoint exit program files :=
+match program with
+| Read path next => exit (next (read path files)) files
+| Write path data next =>
+  let (wr, files') := write path data files
+  in exit (next wr) files'
+| Exit e => e
+end.
+
+Fixpoint run program files: Files :=
+match program with
 | Read path next => run (next (read path files)) files
 | Write path data next =>
   let (wr, files') := write path data files
   in run (next wr) files'
-| Exit n => files
+| Exit e => files
 end.
 
 Definition cp from to := Read from (fun rr => match rr with
-| ReadIsDir => Exit 1
-| ReadNotDir => Exit 2
-| ReadNoEnt => Exit 3
 | ReadSuccess data => Write to data (fun wr => match wr with
-  | WriteIsDir => Exit 4
-  | WriteNotDir => Exit 5
-  | WriteNoEnt => Exit 6
-  | WriteSuccess => Exit 0
+  | WriteSuccess => Exit true
+  | _            => Exit false
   end)
+| _ => Exit false
 end
 ).
 
-Definition ex: Action := and_then (cp (1::nil) (2::nil)) (cp (3::nil) (4::nil)).
+Definition ex: Program := and_then (cp (1::nil) (2::nil)) (cp (3::nil) (4::nil)).
 
 Compute (run ex exfs).
 Compute (trace ex exfs).
-Definition action_eq a a' := forall f, run a f = run a' f.
+Definition program_eq a a' := forall f, run a f = run a' f.
 
-Notation "A ~ B" := (action_eq A B) (at level 86).
+Notation "A ~ B" := (program_eq A B) (at level 86).
 
-Lemma action_eq_refl: forall a, a ~ a.
-Proof. unfold action_eq. induction a.
+Lemma program_eq_refl: forall a, a ~ a.
+Proof. unfold program_eq. induction a.
 - simpl. intros. apply H.
 - simpl. intros. destruct (write p d f). apply H.
 - simpl. tauto.
 Qed.
 
-Lemma action_eq_run: forall a b,
+Lemma program_eq_run: forall a b,
 a ~ b <-> forall f, run a f = run b f.
 Proof. split.
 - intros. apply H.
-- intros. unfold action_eq. apply H.
+- intros. unfold program_eq. apply H.
 Qed.
 
-Lemma action_eq_trans: forall a b c,
+Lemma program_eq_trans: forall a b c,
 a ~ b -> b ~ c -> a ~ c.
 Proof.
-intros. unfold action_eq in H. unfold action_eq in H0. unfold action_eq.
+intros. unfold program_eq in H. unfold program_eq in H0. unfold program_eq.
 intros. rewrite H. rewrite H0. reflexivity.
 Qed.
 
-Lemma action_eq_comm: forall a b,
+Lemma program_eq_comm: forall a b,
 a ~ b -> b ~ a.
 Proof.
-intros. unfold action_eq. unfold action_eq in H.
+intros. unfold program_eq. unfold program_eq in H.
 intros. symmetry. apply H.
 Qed.
 
-Definition trivial_memo (log : list Trace) (action : Action): Action := action.
+Definition trivial_memo (log : list Trace) (program : Program): Program := program.
 
 Lemma trivial_memo_correct : forall a w, trivial_memo (trace a w) a ~ a.
-Proof. unfold action_eq. unfold trivial_memo. tauto. Qed.
+Proof. unfold program_eq. unfold trivial_memo. tauto. Qed.
 
 Definition rreq r1 r2 :=
 match r1, r2 with
 | ReadIsDir, ReadIsDir => true
 | ReadNoEnt, ReadNoEnt => true
 | ReadNotDir, ReadNotDir => true
+| ReadNoPath, ReadNoPath => true
 | ReadSuccess d1, ReadSuccess d2 => Nat.eqb d1 d2
 | _, _ => false
 end.
@@ -190,117 +212,96 @@ Proof. split.
   auto. intros. inversion H. intros. inversion H. intros. inversion H. intros. inversion H.
   auto. intros. inversion H. intros. inversion H. intros. inversion H. intros. inversion H.
   auto. intros. inversion H. intros. inversion H. intros. inversion H. intros. inversion H.
-  auto. intros. simpl in H. apply PeanoNat.Nat.eqb_eq in H. rewrite H. reflexivity.
+  auto. intros. inversion H. intros. inversion H. intros. inversion H. intros. inversion H.
+  auto. intros. inversion H. intros. inversion H. intros. inversion H. intros. inversion H.
+  auto. intros. inversion H. intros. inversion H. intros. inversion H. intros. inversion H.
+  auto. intros. inversion H. intros. inversion H. intros. inversion H. intros. inversion H.
+  auto. intros. inversion H. intros. simpl in H. apply PeanoNat.Nat.eqb_eq in H. rewrite H. reflexivity.
 - intros. rewrite H. destruct r2.
-  auto. auto. auto. simpl. apply PeanoNat.Nat.eqb_refl.
+  auto. auto. auto. auto. simpl. apply PeanoNat.Nat.eqb_refl.
 Qed.
 
-Fixpoint r_memo log action :=
-match log with
-| TRead path result :: log' =>
-  Read path (fun result' =>
-    if rreq result result'
-    then r_memo log' action
-    else action
-  )
-| TExit status :: log' => Exit status
-| _ => action
-end.
-
-Lemma r_memo_fold_read: forall log a p f f',
-run (r_memo (trace log f) (Read p a)) f' =
-run (r_memo (trace log f) (a (read p f'))) f'.
-Proof. induction log.
-- intros. simpl. destruct (rreq (read p f) (read p f')).
-  + apply H.
-  + reflexivity.
-- intros. simpl. destruct (write p d f). reflexivity.
-- intros. reflexivity.
-Qed.
-
-Theorem r_memo_correct: forall a f, r_memo (trace a f) a ~ a.
-Proof. induction a.
-- simpl. unfold action_eq. intros f f'.
-  simpl. destruct (rreq (read p f) (read p f')) eqn:Heq.
-  + apply rreq_eq in Heq. rewrite r_memo_fold_read.
-    rewrite <- Heq.
-    clear Heq. generalize dependent f'. rewrite <- action_eq_run.
-    pose (H (read p f)). apply a0.
-  + reflexivity.
-- intros. simpl. destruct (write p d f). simpl. apply action_eq_refl.
-- intros. simpl. apply action_eq_refl.
+Lemma rreq_ne: forall r1 r2, rreq r1 r2 = false <-> r1 <> r2.
+Proof. split.
+- destruct r1, r2.
+  + intros. inversion H. + congruence. + congruence. + congruence. + congruence. + congruence.
+  + intros. inversion H. + congruence. + congruence. + congruence. + congruence. + congruence.
+  + intros. inversion H. + congruence. + congruence. + congruence. + congruence. + congruence.
+  + intros. inversion H. + congruence. + congruence. + congruence. + congruence. + congruence.
+  + intros. apply PeanoNat.Nat.eqb_neq in H. congruence.
+- intros. destruct r1, r2.
+  + congruence. + reflexivity. + reflexivity. + reflexivity. + reflexivity. + reflexivity.
+  + congruence. + reflexivity. + reflexivity. + reflexivity. + reflexivity. + reflexivity.
+  + congruence. + reflexivity. + reflexivity. + reflexivity. + reflexivity. + reflexivity.
+  + congruence. + reflexivity. + reflexivity. + reflexivity. + reflexivity. + reflexivity.
+  + generalize dependent H. induction d, d0.
+    * intros. congruence. * intros. reflexivity. * intros. reflexivity.
+    * simpl. intros. apply PeanoNat.Nat.eqb_neq. congruence.
 Qed.
 
 Definition wreq d w r: bool :=
 match w, r with
 | WriteIsDir, ReadIsDir => true
-| WriteNoEnt, ReadNoEnt => true
+| WriteNoPath, ReadNoPath => true
 | WriteNotDir, ReadNotDir => true
 | WriteSuccess, ReadSuccess d' => Nat.eqb d d'
 | _, _ => false
 end.
 
-Lemma wreq_correct: forall d w p f,
-wreq d w (read p f) = true -> write p d f = (w, f).
-Proof. admit. Admitted.
+Lemma pair_eq: forall (A B : Type) (a c : A) (b d : B),
+a = c -> b = d -> (a, b) = (c, d).
+Proof. intros. rewrite H. rewrite H0. reflexivity. Qed.
 
-Fixpoint rw_memo log action :=
+Lemma eqcomp_eq: forall x y, eqcomp x y = true -> x = y.
+Proof. unfold eqcomp. intros. apply PeanoNat.Nat.eqb_eq. apply H. Qed.
+
+Lemma wreq_correct: forall p f w d,
+wreq d w (read p f) = true -> write p d f = (w, f).
+Proof. induction p.
+- intros. simpl. simpl in H. destruct f.
+  + destruct w. * congruence. * inversion H. * inversion H. * inversion H.
+  + destruct w.
+    * inversion H. * inversion H. * inversion H.
+    * apply pair_eq. congruence. simpl in H. apply PeanoNat.Nat.eqb_eq in H.
+      rewrite H. congruence.
+- induction f.
+  + intros. simpl. simpl in H. destruct (lookup eqcomp a m) eqn:Hl.
+    * destruct (write p d f) eqn:Hw. apply IHp in H. rewrite H in Hw. inversion Hw. apply pair_eq.
+      { congruence. }
+      { replace (insert eqcomp a f0 m) with m. congruence.
+        symmetry. apply map_reeinsert. apply eqcomp_eq. rewrite <- H2. apply Hl. }
+    * destruct p.
+      { destruct w. inversion H. inversion H. inversion H. inversion H. }
+      { destruct w. inversion H. congruence. inversion H. inversion H. }
+  + intros. simpl. simpl in H. destruct w. inversion H.
+    inversion H. congruence. inversion H.
+Qed.
+
+Fixpoint dirty log :=
 match log with
 | TRead path result :: log' =>
   Read path (fun result' =>
-    if rreq result result'
-    then rw_memo log' action
-    else action
+    if rreq result result' then dirty log' else Exit true
   )
 | TWrite path data result :: log' =>
   Read path (fun result' =>
-    if wreq data result result'
-    then rw_memo log' action
-    else action
+    if wreq data result result' then dirty log' else Exit true
   )
-| TExit status :: log' => Exit status
-| _ => action
+| TExit e :: log' => Exit false
+| nil => Exit false
 end.
 
-Lemma rw_memo_fold_read: forall log a p f f',
-run (rw_memo (trace log f) (Read p a)) f' =
-run (rw_memo (trace log f) (a (read p f'))) f'.
-Proof. induction log.
-- intros. simpl. destruct (rreq (read p f) (read p f')).
-  + apply H.
-  + reflexivity.
-- intros. simpl. destruct (write p d f). simpl.
-  destruct (wreq d w (read p f')).
-  + apply H.
-  + reflexivity.
+Lemma dirty_correct : forall p f f',
+exit (dirty (trace p f)) f' = false -> run p f' = f'.
+Proof. induction p.
+- intros. simpl. simpl in H0. apply H with (f := f).
+  destruct (rreq (read p f) (read p f')) eqn:Hrr.
+  + apply rreq_eq in Hrr. rewrite <- Hrr. apply H0.
+  + inversion H0.
+- intros. simpl. simpl in H0. destruct (write p d f') eqn:Hw1, (write p d f) eqn:Hw2.
+  simpl in H0. destruct (wreq d w0 (read p f')) eqn:Hwr.
+  + apply wreq_correct in Hwr. inversion Hwr. rewrite Hw1 in H2. inversion H2.
+    apply H with (f := f1). apply H0.
+  + inversion H0.
 - intros. reflexivity.
 Qed.
-
-Lemma rw_memo_fold_write: forall log w a p d f f' f'',
-(w, f'') = write p d f' ->
-run (rw_memo (trace log f) (Write p d a)) f' =
-run (rw_memo (trace log f) (a w)) f''.
-Admitted.
-
-Theorem rw_memo_correct: forall a f, rw_memo (trace a f) a ~ a.
-Proof. induction a.
-- simpl. unfold action_eq. intros f f'.
-  simpl. destruct (rreq (read p f) (read p f')) eqn:Heq.
-  + apply rreq_eq in Heq. rewrite rw_memo_fold_read.
-    rewrite <- Heq.
-    clear Heq. generalize dependent f'. rewrite <- action_eq_run.
-    pose (H (read p f)). apply a0.
-  + reflexivity.
-- simpl. unfold action_eq. intros f f'. simpl.
-  destruct (write p d f) eqn:H1, (write p d f') eqn:H2. simpl.
-  destruct (wreq d w (read p f')) eqn:Heq.
-  + apply wreq_correct in Heq. rewrite Heq in H2. inversion H2.
-    rewrite <- H4. rewrite rw_memo_fold_write with (w := w) (f'' := f1).
-    rewrite H4. clear H1. clear H2. clear H4. generalize dependent f1.
-    rewrite <- action_eq_run. rewrite H3. apply H.
-    rewrite <- H4. symmetry. apply Heq.
-  + simpl. destruct (write p d f'). inversion H2.
-    reflexivity.
-- intros. simpl. apply action_eq_refl.
-Qed.
-
