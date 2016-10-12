@@ -2,297 +2,243 @@ package main
 
 import (
 	"bufio"
-	"encoding/base64"
-	"encoding/gob"
+	"crypto/sha512"
+	"encoding/hex"
 	"flag"
 	"fmt"
-	"log"
+	"io"
+	"math"
 	"os"
 	"os/exec"
-	"path/filepath"
+	pathlib "path"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
 
-// Represents an observed change.  nil means no change; otherwise, a string
-// describing the change.
-type Change *string
-
-// Returns a Change described by fmt.Sprintf(format, args...)
-func Changef(format string, args ...interface{}) Change {
-	ch := fmt.Sprintf(format, args...)
-	return &ch
-}
-
-// A check to see if something has changed.
-type Check interface {
-	Changed() Change
-}
-
-// A check composed of multiple other checks.
-type CheckMulti []Check
-
-func (c CheckMulti) Changed() Change {
-	for _, check := range c {
-		if change := check.Changed(); change != nil {
-			return change
+func AnyPrefix(path string, prefices []string) bool {
+	for _, prefix := range prefices {
+		if strings.HasPrefix(path, prefix) {
+			return true
 		}
 	}
 
-	return nil
+	return false
 }
 
-// Check to see if the stat() has changed.
-// TODO: I guess lstat should be distinguished.
-type CheckStat struct {
-	Path    string
-	Mode    os.FileMode
-	ModTime time.Time
-}
-
-func (c *CheckStat) Changed() Change {
-	stat, err := os.Stat(c.Path)
-	if err != nil {
-		return Changef("%q no longer exists", c.Path)
-	}
-
-	if stat.Mode() != c.Mode {
-		return Changef("%q: Mode changed from %s to %s", c.Path, c.Mode, stat.Mode())
-	}
-
-	if stat.ModTime() != c.ModTime {
-		return Changef("%q: Mod time changed from %s to %s", c.Path, c.ModTime, stat.ModTime())
-	}
-
-	return nil
-}
-
-// Checks if the file still doesn't exist.
-type CheckNotFound struct {
-	Path string
-}
-
-func (c *CheckNotFound) Changed() Change {
-	_, err := os.Stat(c.Path)
-	if os.IsNotExist(err) {
-		return nil
-	} else {
-		return Changef("%q now exists", c.Path)
-	}
-}
-
-// Checks if the file is a dir.
-type CheckDir struct {
-	Path string
-}
-
-func (c *CheckDir) Changed() Change {
-	stat, err := os.Stat(c.Path)
-	if err != nil {
-		return Changef("%q: stat failed %s", err)
-	} else if !stat.IsDir() {
-		return Changef("%q: no longer a dir")
-	} else {
-		return nil
-	}
-}
-
-var reCall *regexp.Regexp = regexp.MustCompile(`^\d+\s+(\w+)\("(.*?)"(.*)$`)
-var reIgnore *regexp.Regexp = regexp.MustCompile(`^\d+\s+(\+{3}|-{3})`)
-
-// Parse a line from strace into a Check.
-func ParseLine(line string) (Check, error) {
-	if reIgnore.MatchString(line) {
-		return nil, nil
-	}
-
-	var m []string
-
-	if m = reCall.FindStringSubmatch(line); m == nil {
-		return nil, fmt.Errorf("Couldn't parse %q", line)
-	} else {
-		//call := m[1]
-		path := m[2]
-
-		if strings.HasPrefix(path, "/tmp") || strings.HasPrefix(path, "/proc") {
-			return nil, nil
-		}
-
-		//args := m[3]
-		abs, err := filepath.Abs(path)
-		if err != nil {
-			return nil, err
-		}
-
-		stat, err := os.Stat(abs)
-		if os.IsNotExist(err) {
-			return &CheckNotFound{abs}, nil
-		} else if err != nil {
-			return nil, err
-		} else if stat.IsDir() {
-			return &CheckDir{
-				Path: abs,
-			}, nil
-		} else {
-			return &CheckStat{
-				Path:    abs,
-				Mode:    stat.Mode(),
-				ModTime: stat.ModTime(),
-			}, nil
-		}
-	}
-}
-
-// Run a command, strace it, and return a Check that can be used to see if the
-// program's dependent state has changed.
-func Run(name string, args ...string) (Check, error) {
-	r, w, err := os.Pipe()
-	if err != nil {
-		return nil, err
-	}
-	defer r.Close()
-	defer w.Close()
-
-	strace := []string{"-f", "-o", "/dev/fd/3", "-e", "trace=file", "--"}
-	strace = append(strace, name)
-	strace = append(strace, args...)
-	cmd := exec.Command("strace", strace...)
-	cmd.ExtraFiles = []*os.File{w}
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Stdin = os.Stdin
-
-	if err := cmd.Start(); err != nil {
-		return nil, err
-	}
-
-	lineChan := make(chan string)
-	scanErrChan := make(chan error)
-	finishedChan := make(chan error)
-
-	go func() {
-		finishedChan <- cmd.Wait()
-	}()
-
-	go func() {
-		scanner := bufio.NewScanner(r)
-		for scanner.Scan() {
-			lineChan <- scanner.Text()
-		}
-		if err := scanner.Err(); err != nil {
-			scanErrChan <- err
-		}
-	}()
-
-	lines := make([]string, 0)
-
-loop1:
-	for {
-		select {
-		case line := <-lineChan:
-			lines = append(lines, line)
-		case err := <-finishedChan:
-			if err != nil {
-				return nil, err
-			} else {
-				break loop1
-			}
+func In(needle string, haystack []string) bool {
+	for _, h := range haystack {
+		if needle == h {
+			return true
 		}
 	}
 
-loop2:
-	for {
-		select {
-		case line := <-lineChan:
-			lines = append(lines, line)
-		default:
-			break loop2
-		}
-	}
-
-	checks := make([]Check, 0, len(lines))
-
-	for _, line := range lines {
-		check, err := ParseLine(line)
-		if err != nil {
-			return nil, err
-		}
-
-		if check != nil {
-			checks = append(checks, check)
-		}
-	}
-
-	return CheckMulti(checks), nil
+	return false
 }
 
-const cachedir string = ".memo"
-
-// Checks if the command described by cachedir/name needs to be rerun because
-// something in its environment has changed.
-func NeedsRerun(name string) (bool, error) {
-	logfile, err := os.Open(cachedir + "/" + name)
+// Remember, it's better to have a false dirty than a false clean.
+// Needs to be tested against a lot of different programs, esp complicated
+// ones like compilers.
+func CheckDirty(logPath string) (bool, error) {
+	f, err := os.Open(logPath)
 	if os.IsNotExist(err) {
 		return true, nil
 	} else if err != nil {
-		return false, err
+		return true, err
 	}
-	defer logfile.Close()
+	defer f.Close()
 
-	check := &CheckMulti{}
+	r := bufio.NewReader(f)
 
-	if err := gob.NewDecoder(logfile).Decode(check); err != nil {
-		return false, err
+	reMain := regexp.MustCompile(`^\d+\s+(\d+\.\d+)\s+(\w+?)\((.*?)\)\s+=\s+(.*?)\n$`)
+	rePath := regexp.MustCompile(`^"(.*?)"|\d+<(.*?)>,`)
+	reOpen := regexp.MustCompile(`^"(.*?)", ([\w|]+)(, (\d+))?`)
+	reExit := regexp.MustCompile(`^\d+\s+\d+\.\d+\s+\+\+\+ exited with (-?\d+) \+\+\+\n$`)
+	reRet := regexp.MustCompile(`^(-?\d+)\s*(\w+)?`)
+	ignoreSyscalls := []string{"brk", "mmap", "fstat", "close", "read", "mprotect", "arch_prctl", "munmap", "dup2", "set_tid_address", "set_robust_list", "rt_sigaction", "rt_sigprocmask", "getrlimit", "statfs" /*?*/, "geteuid", "fadvise64", "write", "lseek", "exit_group"}
+	readSyscalls := []string{"execve", "access", "stat"}
+	alwaysSyscalls := []string{"utimensat"}
+	ignorePaths := []string{"/proc/"}
+
+	var m []string
+
+	for {
+		line, err := r.ReadString('\n')
+		if err == io.EOF {
+			return false, nil
+		}
+
+		if m = reExit.FindStringSubmatch(line); m != nil {
+			// TODO: We should use the exit value and stuff, but only if it's
+			//       the top level process I guess.  Maybe store the exit code
+			//       in a variable and return it at the end.
+			continue
+		}
+
+		m = reMain.FindStringSubmatch(line)
+		if m == nil {
+			return true, fmt.Errorf("Could not understand %q", line)
+		} else {
+			timestamp, err := strconv.ParseFloat(m[1], 64)
+			if err != nil {
+				return true, err
+			}
+
+			t := time.Unix(int64(timestamp), int64((timestamp-math.Trunc(timestamp))*1e9))
+			syscall := m[2]
+			args := m[3]
+			ret := m[4]
+
+			if In(syscall, alwaysSyscalls) {
+				return true, nil
+			} else if In(syscall, ignoreSyscalls) {
+				continue
+			} else if syscall == "open" {
+				m = reOpen.FindStringSubmatch(args)
+				if m == nil {
+					return true, fmt.Errorf("Could not understand args in %q", line)
+				}
+				path := m[1]
+
+				if AnyPrefix(path, ignorePaths) {
+					continue
+				}
+
+				flagSlice := strings.Split(m[2], "|")
+				flags := make(map[string]bool)
+
+				for _, flag := range flagSlice {
+					flags[flag] = true
+				}
+
+				m = reRet.FindStringSubmatch(ret)
+				if m == nil {
+					return true, fmt.Errorf("Could not understand return value in %q", line)
+				}
+				//retcode := m[1]
+				retname := m[2]
+
+				if flags["O_RDONLY"] {
+					fi, err := os.Stat(path)
+					if retname == "ENOENT" {
+						if !os.IsNotExist(err) {
+							return true, nil
+						}
+					} else if retname == "" {
+						if os.IsNotExist(err) {
+							return true, nil
+						} else if err != nil {
+							return true, err
+						}
+
+						if t.Before(fi.ModTime()) {
+							return true, nil
+						}
+					} else {
+						return true, fmt.Errorf("Could not understand return value %q", retname)
+					}
+				} else if flags["O_WRONLY"] && (flags["O_TRUNC"] || flags["O_CREAT"]) {
+					if retname == "" {
+						fi, err := os.Stat(path)
+						if os.IsNotExist(err) || fi != nil && t.Before(fi.ModTime()) {
+							return true, nil
+						} else if err != nil {
+							return true, err
+						}
+					} else if retname == "ENOENT" {
+						_, err := os.Stat(pathlib.Dir(path))
+
+						if !os.IsNotExist(err) {
+							return true, nil
+						}
+					} else {
+						return true, fmt.Errorf("Could not understand return value %q", retname)
+					}
+				} else {
+					return true, fmt.Errorf("Could not understand flags in %q", line)
+				}
+			} else if In(syscall, readSyscalls) {
+				m = rePath.FindStringSubmatch(args)
+				if m == nil {
+					return true, fmt.Errorf("Could not understand args in %q", line)
+				}
+				path := m[1]
+
+				m = reRet.FindStringSubmatch(ret)
+				if m == nil {
+					return true, fmt.Errorf("Could not understand return value in %q", line)
+				}
+				//retcode := m[1]
+				retname := m[2]
+
+				fi, err := os.Stat(path)
+				if retname == "ENOENT" {
+					if !os.IsNotExist(err) {
+						return true, nil
+					}
+				} else if retname == "" {
+					if os.IsNotExist(err) {
+						return true, nil
+					} else if err != nil {
+						return true, err
+					}
+
+					if t.Before(fi.ModTime()) {
+						return true, nil
+					}
+				}
+
+				continue
+			} else {
+				return true, fmt.Errorf("Unknown syscall in %q", line)
+			}
+		}
+	}
+}
+
+func Main() error {
+	flag.Parse()
+	command := flag.Args()
+
+	if len(command) < 1 {
+		return fmt.Errorf("Please supply a command")
 	}
 
-	change := check.Changed()
+	commandHash := sha512.Sum512([]byte(fmt.Sprintf("%#v", command)))
+	commandHex := hex.EncodeToString(commandHash[:])
+	commandLog := ".memo/" + commandHex
 
-	if change != nil {
-		fmt.Println(*change)
+	if dirty, err := CheckDirty(commandLog); err != nil {
+		return err
+	} else if dirty {
+		fmt.Println("dirty, rerun")
+		if err := os.MkdirAll(".memo", 0776); err != nil {
+			return err
+		}
+
+		straceArgs := make([]string, 0)
+		straceArgs = append(straceArgs, "-o", commandLog)
+		straceArgs = append(straceArgs, "-f", "-y", "-ttt")
+		//straceArgs = append(straceArgs, "-e", "trace=file")
+		straceArgs = append(straceArgs, command...)
+
+		cmd := exec.Command("strace", straceArgs...)
+		cmd.Stderr = os.Stderr
+
+		if err := cmd.Run(); err != nil {
+			return err
+		}
+	} else {
+		fmt.Println("skipping")
 	}
 
-	return change != nil, nil
+	return nil
 }
 
 func main() {
-	flag.Parse()
-
-	gob.Register(CheckMulti{})
-	gob.Register(new(CheckStat))
-	gob.Register(new(CheckNotFound))
-	gob.Register(new(CheckDir))
-
-	if err := os.MkdirAll(cachedir, 0755); err != nil {
-		log.Fatalf("Making %q: %s", cachedir, err)
-	}
-
-	command := flag.Args()
-
-	name := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf("%v", command)))
-
-	needsRerun, err := NeedsRerun(name)
-	if err != nil {
-		log.Fatal("Checking if needs rerun", err)
-	}
-
-	if needsRerun {
-		fmt.Println("Running", command)
-		check, err := Run(command[0], command[1:]...)
-		if err != nil {
-			log.Fatal("Running command", err)
-		}
-
-		file, err := os.Create(cachedir + "/" + name)
-		if err != nil {
-			log.Fatal("Creating tracefile", err)
-		}
-		defer file.Close()
-
-		if err := gob.NewEncoder(file).Encode(check); err != nil {
-			log.Fatal("Decoding tracefile", err)
-		}
-	} else {
-		fmt.Println("Skipping", command)
+	if err := Main(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 }
